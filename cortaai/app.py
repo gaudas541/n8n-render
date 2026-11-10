@@ -3,7 +3,7 @@ Run with: uvicorn app:app --host 127.0.0.1 --port 8000
 Never expose to the public internet without authentication, TLS and quotas.
 """
 from __future__ import annotations
-import asyncio, json, os, re, uuid, ipaddress, socket, subprocess, shutil, time, base64, secrets
+import asyncio, json, os, re, uuid, ipaddress, socket, subprocess, shutil, time, base64, secrets, threading, zipfile
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 from typing import Any
@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from video_links import validate_video_url, download_source
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('CORTAAI_DATA', ROOT / 'data'))
@@ -23,7 +24,7 @@ REQUIRE_AUTH = os.environ.get('CORTAAI_REQUIRE_AUTH', '0') == '1'
 ACCESS_PASSWORD = os.environ.get('CORTAAI_ACCESS_PASSWORD', '')
 if REQUIRE_AUTH and len(ACCESS_PASSWORD) < 16:
  raise RuntimeError('Public deployment requires CORTAAI_ACCESS_PASSWORD (16+ characters).')
-app = FastAPI(title='CortaAI Studio', version='1.0.1')
+app = FastAPI(title='CortaAI Studio', version='1.1.0')
 
 @app.middleware('http')
 async def access_control(request: Request, call_next):
@@ -76,6 +77,10 @@ async def private_studio_access(request: Request, call_next):
 
 JOBS: dict[str, dict] = {}
 MAX_VIDEO = int(os.environ.get('CORTAAI_MAX_VIDEO_BYTES', 2 * 1024**3))
+LINK_JOBS: dict[str, dict] = {}
+LINK_LOCK = threading.Lock()
+LINK_BUSY = False
+
 DEFAULTS = {
  'nvidia': 'https://integrate.api.nvidia.com/v1',
  'groq': 'https://api.groq.com/openai/v1',
@@ -134,6 +139,90 @@ async def upload(uid: str, request: Request):
   f.unlink(missing_ok=True)
   raise
 
+class ImportLinkRequest(BaseModel):
+ url: str = Field(min_length=1, max_length=500)
+ rightsConfirmed: bool = False
+
+
+def import_link_worker(job_id: str, url: str, platform: str, video_id: str):
+ global LINK_BUSY
+ job = LINK_JOBS[job_id]
+ f, m = video_paths(video_id)
+ try:
+  # This worker is intentionally single-file and single-job; Render Free has
+  # limited CPU/memory/disk and in-memory jobs are lost on restart.
+  result = download_source(url, job, TEMPS / (video_id + '.download'), max_bytes=MAX_VIDEO)
+  # download_source writes to a temporary .download target (not a video ext);
+  # ffprobe reads by probing file contents rather than the suffix.
+  temp = TEMPS / (video_id + '.download')
+  temp.replace(f)
+  meta = probe_video(f)
+  name = result['title'] + result['ext']
+  meta.update({'id': video_id, 'name': name, 'createdAt': int(time.time()*1000),
+               'origin': 'link', 'platform': platform, 'sourceUrl': url,
+               'uploader': result['uploader']})
+  sub_path = result.get('subtitle_path')
+  if sub_path and Path(sub_path).is_file():
+   output = VIDS / (video_id + Path(sub_path).suffix.lower())
+   Path(sub_path).replace(output)
+   meta['hasSubtitles'] = True
+  else:
+   meta['hasSubtitles'] = False
+  m.write_text(json.dumps(meta, ensure_ascii=False), 'utf-8')
+  job.update(status='done', progress=1, message='Vídeo importado', video=meta)
+ except Exception as ex:
+  f.unlink(missing_ok=True)
+  m.unlink(missing_ok=True)
+  # Avoid exposing private extractor URLs or internal paths in error messages.
+  message = str(ex)
+  if len(message) > 300 or 'https://' in message or '/tmp/' in message:
+   message = 'Falha ao importar: vídeo indisponível, acima do limite ou plataforma bloqueou o download.'
+  job.update(status='error', progress=0, message=message)
+ finally:
+  for item in TEMPS.glob(video_id + '.*'):
+   if item.is_file(): item.unlink(missing_ok=True)
+  with LINK_LOCK:
+   LINK_BUSY = False
+
+
+@app.post('/api/import-link')
+async def import_by_link(r: ImportLinkRequest):
+ global LINK_BUSY
+ if not r.rightsConfirmed:
+  raise HTTPException(400, 'Confirme que o vídeo é seu ou que possui autorização para editá-lo.')
+ url, platform = validate_video_url(r.url)
+ if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+  raise HTTPException(503, 'FFmpeg indisponível no servidor.')
+ with LINK_LOCK:
+  if LINK_BUSY: raise HTTPException(429, 'Já há um link sendo importado. Conclua a importação atual antes de iniciar outra.')
+  LINK_BUSY = True
+ video_id = str(uuid.uuid4())
+ job_id = str(uuid.uuid4())
+ LINK_JOBS[job_id] = {'status': 'queued', 'progress': 0, 'message': 'Preparando importação', 'platform': platform}
+ if len(LINK_JOBS) > 30:
+  for old in list(LINK_JOBS)[:-30]: LINK_JOBS.pop(old, None)
+ asyncio.create_task(asyncio.to_thread(import_link_worker, job_id, url, platform, video_id))
+ return {'jobId': job_id, 'platform': platform}
+
+
+@app.get('/api/import-link/{job_id}')
+def get_import_status(job_id: str):
+ job_id = clean_id(job_id)
+ result = LINK_JOBS.get(job_id)
+ if result is None: raise HTTPException(404, 'Importação não encontrada; o servidor pode ter reiniciado.')
+ return result
+
+
+@app.get('/api/videos/{uid}/subtitles')
+def imported_subtitles(uid: str):
+ get_video(uid)
+ for ext in ('.vtt', '.srt'):
+  path = VIDS / (clean_id(uid) + ext)
+  if path.is_file():
+   return {'content': path.read_text('utf-8', errors='replace')[:2_000_000], 'format': ext[1:]}
+ raise HTTPException(404, 'Nenhuma legenda disponível no vídeo importado.')
+
+
 @app.get('/api/videos')
 def list_videos():
  out=[]
@@ -149,7 +238,7 @@ def detail(uid:str): return get_video(uid)
 def delete_video(uid:str):
  f,m=video_paths(uid)
  f.unlink(missing_ok=True); m.unlink(missing_ok=True)
- for ext in ('.jpg','.png'): (VIDS/f'{clean_id(uid)}{ext}').unlink(missing_ok=True)
+ for ext in ('.jpg','.png','.srt','.vtt'): (VIDS/f'{clean_id(uid)}{ext}').unlink(missing_ok=True)
  return {'ok':True}
 
 @app.get('/media/{uid}')
@@ -279,6 +368,51 @@ async def start_export(e:ExportIn):
  asyncio.create_task(asyncio.to_thread(encode_clip,e,job))
  return {'jobId':job}
 
+class BatchExportIn(BaseModel):
+ clips: list[ExportIn] = Field(min_length=1, max_length=5)
+
+
+def render_batch_exports(clips: list[ExportIn], batch_id: str):
+ path = EXPORTS / f'{batch_id}.zip'
+ children=[]
+ try:
+  with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_STORED) as archive:
+   for i,clip in enumerate(clips):
+    subjob=str(uuid.uuid4())
+    JOBS[batch_id]={'status':'processing','progress':i/len(clips),'message':f'Gerando clipe {i+1} de {len(clips)}…'}
+    encode_clip(clip, subjob)
+    item=JOBS[subjob]
+    if item['status']!='done':
+     raise RuntimeError(item.get('error', 'Falha ao exportar um dos clipes.'))
+    file=Path(item['output'])
+    archive.write(file, arcname=f'CortaAI-{i+1:02d}.mp4')
+    children.append(file)
+    JOBS.pop(subjob,None)
+   JOBS[batch_id]={'status':'done','progress':1,'output':str(path),'message':f'{len(clips)} MP4 prontos no ZIP'}
+ except Exception as ex:
+  path.unlink(missing_ok=True)
+  JOBS[batch_id]={'status':'error','progress':0,'error':str(ex)[:350]}
+ finally:
+  for file in children:
+   file.unlink(missing_ok=True)
+
+
+@app.post('/api/exports/batch')
+async def start_batch_export(r: BatchExportIn):
+ if len(r.clips)>5:
+  raise HTTPException(400,'Este servidor permite até 5 vídeos por lote.')
+ for clip in r.clips:
+  meta=get_video(clip.videoId)
+  if not (0<=clip.start<clip.end<=meta['duration']+.05):
+   raise HTTPException(400,'Intervalo inválido em um dos cortes.')
+  if clip.end-clip.start>90:
+   raise HTTPException(400,'Cada corte em lote deve ter no máximo 90 segundos.')
+ job=str(uuid.uuid4())
+ JOBS[job]={'status':'queued','progress':0}
+ asyncio.create_task(asyncio.to_thread(render_batch_exports,r.clips,job))
+ return {'jobId':job}
+
+
 @app.get('/api/exports/{job}')
 def export_status(job:str):
  job=clean_id(job)
@@ -291,7 +425,7 @@ def export_status(job:str):
 def download(job:str):
  job=clean_id(job); j=JOBS.get(job,{})
  if j.get('status')!='done': raise HTTPException(404,'Exportação ainda não concluída')
- return FileResponse(j['output'],media_type='video/mp4',filename=f'CortaAI-{job[:8]}.mp4')
+ return FileResponse(j['output'],media_type='application/zip' if j['output'].endswith('.zip') else 'video/mp4',filename=f'CortaAI-{job[:8]}.zip' if j['output'].endswith('.zip') else f'CortaAI-{job[:8]}.mp4')
 
 
 def safe_base(provider:str, base:str, allowed_custom: bool=True) -> str:
